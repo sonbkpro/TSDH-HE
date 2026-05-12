@@ -1,0 +1,61 @@
+seed: 123
+amp: false
+device: cuda
+model:
+  feature_channels: 1
+  pretrained_backbone: true
+  support_hidden: 16
+  nonh_hidden: 16
+data:
+  train_video_dir: dataset/train
+  crop_h: 315
+  crop_w: 560
+  img_h: 360
+  img_w: 640
+  rho: 16
+  temporal_gap_min: 1
+  temporal_gap_max: 3
+  pairs_per_epoch: 12000
+  batch_size: 8
+  num_workers: 4
+  deterministic_sampling: false
+  val_npy_dir: dataset/val_labels
+  val_image_root: dataset/val_images
+  eval_crop_x: 40
+  eval_crop_y: 23
+  eval_max_points: 6
+train:
+  out_dir: runs/v4_tsdh_net
+  total_iters: 120000
+  # Staged optimization is deliberately conservative. Stage 1 is V1-like.
+  stage1_iters: 60000
+  stage2_iters: 85000
+  stage3_iters: 105000
+  lr: 0.0001
+  stage2_lr: 0.000064
+  stage2_lr_mode: min
+  beta1: 0.9
+  beta2: 0.999
+  eps: 1.0e-8
+  amsgrad: true
+  weight_decay: 0.0001
+  lr_decay_every: 12000
+  lr_decay_gamma: 0.8
+  log_every: 100
+  save_every: 2000
+  val_every: 2000
+  clip_grad_norm: 10.0
+  data_parallel: false
+loss:
+  triplet_margin: 1.0
+  min_support: 0.15
+  cycle_support_alpha: 1.0
+  weights:
+    triplet: 1.0
+    init_triplet: 0.0
+    support_reg: 0.0
+    pixel_cycle_support: 0.0
+    homography_cycle: 0.0
+    nonh: 0.0
+    decomposition: 0.0
+    point: 0.0

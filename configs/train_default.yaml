@@ -1,0 +1,53 @@
+seed: 42
+device: cuda
+amp: false
+data:
+  # Official released Oneline geometry. If train_list/train_image_root are set,
+  # training follows Data/Train_List.txt-style image pairs; otherwise it samples
+  # pairs directly from train_video_dir and applies the same patch protocol.
+  train_list:
+  train_image_root:
+  train_video_dir: dataset/train
+  val_npy_dir: dataset/val_labels
+  val_image_root: dataset/val_images
+  categories: [regular, low-texture, low-light, small-foreground, large-foreground]
+  img_h: 360
+  img_w: 640
+  crop_h: 315
+  crop_w: 560
+  rho: 16
+  eval_crop_x: 40
+  eval_crop_y: 23
+  eval_max_points: 6
+  temporal_gap_min: 1
+  temporal_gap_max: 5
+  pairs_per_epoch: 12000
+  batch_size: 32
+  num_workers: 4
+  deterministic_sampling: false
+model:
+  feature_channels: 1
+  pretrained_backbone: true
+loss:
+  triplet_margin: 1.0
+train:
+  total_iters: 120000
+  stage1_iters: 60000
+  lr: 0.0001
+  stage2_lr: 0.000064
+  stage2_lr_mode: min
+  stage1_use_attention: true
+  stage1_use_mask_weighting: false
+  stage2_use_attention: true
+  stage2_use_mask_weighting: true
+  beta1: 0.9
+  beta2: 0.999
+  eps: 0.00000001
+  amsgrad: true
+  weight_decay: 0.0001
+  lr_decay_every: 12000
+  lr_decay_gamma: 0.8
+  log_every: 50
+  val_every: 2000
+  ckpt_every: 5000
+  out_dir: runs/content_aware_homography

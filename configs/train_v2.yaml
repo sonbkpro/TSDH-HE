@@ -1,0 +1,59 @@
+seed: 42
+device: cuda
+amp: false
+
+data:
+  train_video_dir: dataset/train
+  val_npy_dir: dataset/val_labels
+  val_image_root: dataset/val_images
+
+  # Same geometry as V1 / ECCV Oneline implementation.
+  img_h: 360
+  img_w: 640
+  crop_h: 315
+  crop_w: 560
+  rho: 16
+  eval_crop_x: 40
+  eval_crop_y: 23
+  eval_max_points: 6
+
+  # Your setting: slightly moving camera, own videos.
+  temporal_gap_min: 1
+  temporal_gap_max: 3
+  pairs_per_epoch: 12000
+  batch_size: 8        # safe starting value for 2 GPUs / K=4; increase after monitoring memory
+  num_workers: 4
+  deterministic_sampling: false
+
+model:
+  feature_channels: 1
+  num_hypotheses: 4
+
+loss:
+  triplet_margin: 1.0
+  diversity: 0.02
+  mask_entropy: 0.01
+  mask_balance: 0.001
+  diversity_scale: 16.0
+  temporal_cycle: 0.1
+
+train:
+  total_iters: 120000
+  lr: 0.0001
+  beta1: 0.9
+  beta2: 0.999
+  eps: 0.00000001
+  amsgrad: true
+  weight_decay: 0.0001
+  lr_decay_every: 12000
+  lr_decay_gamma: 0.8
+  grad_clip: 10.0
+  log_every: 50
+  val_every: 2000
+  ckpt_every: 5000
+  out_dir: runs/v2_multi_hypothesis_homography
+
+  # Stage recommendation:
+  # 1) false for first stable pairwise training.
+  # 2) after pairwise model is stable, set true for temporal cycle fine-tuning.
+  use_temporal_cycle: false
