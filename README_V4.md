@@ -128,3 +128,30 @@ A safe IEEE TIP-style claim is:
 > We propose Temporal Support-Decomposed Homography Estimation, where one dominant global homography is estimated only from regions that remain temporally consistent under homography composition, while non-homographic residual regions are explicitly modeled rather than forced into the global transform.
 
 Do not claim that one homography completely solves multi-plane geometry. V4 estimates the dominant global homography robustly.
+
+## Stability patch notes
+
+This package includes the strict V4 stability patch:
+
+1. During `s1_v1_warmup`, `TSDHNet.forward_pair(..., use_temporal_support=False)` now returns the V1-style initial branch as the final output (`H = H_init`). It no longer trains the second support-decomposed estimator during warm-up.
+2. V4 validation now uses the same direct/swapped point-order guard as the V1 evaluator, so `point_l2_mean` is comparable with V1.
+3. Trainer validation disables temporal support automatically during `s1_v1_warmup`, so validation measures the same branch being trained.
+
+Expected Stage-1 validation behavior:
+
+```text
+point_l2_mean ≈ init_point_l2_mean
+refine_gain ≈ 0
+support_mean ≈ 1.0
+nonh_mean ≈ 0.0
+```
+
+If you manually evaluate a Stage-1 checkpoint, use:
+
+```bash
+python scripts_v4/eval_v4_labeled_points.py \
+  --ckpt runs/v4_tsdh_net/last.pt \
+  --npy_dir dataset/val_labels \
+  --image_root dataset/val_images \
+  --no_temporal_support
+```

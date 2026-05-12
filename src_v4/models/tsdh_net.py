@@ -150,11 +150,47 @@ class TSDHNet(nn.Module):
         })
         return out
 
+    def _return_init_as_final(self, init: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Return the V1-style initial branch as the final output.
+
+        This is intentionally used during Stage 1 warm-up. In V1, the mask is
+        used as attention for estimating H, while mask weighting in the loss can
+        be disabled. Earlier V4 versions still ran a second support-decomposed
+        estimator when temporal support was disabled, which made Stage 1 *not*
+        equivalent to V1 and caused unstable validation: H_init was good but H
+        was worse.
+        """
+        out = dict(init)
+        z = torch.zeros_like(init['support_init'])
+        out.update({
+            'H': init['H_init'],
+            'offsets': init['offsets_init'],
+            'Ga': init['Ga_init'],
+            'Gb': init['Gb_init'],
+            'pred_ib': init['init_pred_ib'],
+            'pred_ib_feature': init['init_pred_ib_feature'],
+            'mask_ap': init['support_init'],
+            'support_temporal': init['support_init'],
+            'support_ap': init['support_init'],
+            'support_final': init['support_init'],
+            'residual_final': init['residual_init'],
+            # Non-homographic branch is inactive in true V1 warm-up.
+            'nonh_map': z,
+            'ma_full': init['ma_full'],
+            'mb_full': init['mb_full'],
+        })
+        return out
+
     def forward_pair(self, org_images, input_tensors, h4p, patch_indices,
                      use_attention: bool = True, use_mask_weighting: bool = True,
                      use_temporal_support: bool = True) -> Dict[str, torch.Tensor]:
         init = self._initial_pair(org_images, input_tensors, h4p, patch_indices, use_attention, use_mask_weighting)
-        support = self._support_refine_pair(init) if use_temporal_support else init['support_init']
+        # Critical stability fix: Stage 1 must be a true V1-style warm-up.
+        # When temporal support is disabled, do not train/evaluate the second
+        # support-decomposed estimator. Use H_init as H.
+        if not use_temporal_support:
+            return self._return_init_as_final(init)
+        support = self._support_refine_pair(init)
         return self._final_from_support(init, support, use_attention=use_attention, use_mask_weighting=use_mask_weighting)
 
     def _pair_from_dict(self, p: dict, use_attention: bool, use_mask_weighting: bool) -> Dict[str, torch.Tensor]:

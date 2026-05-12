@@ -191,7 +191,11 @@ class TrainerV4:
                 d['val_npy_dir'], d['val_image_root'], d['crop_h'], d['crop_w'],
                 d.get('img_h', 360), d.get('img_w', 640), d.get('eval_crop_x', 40), d.get('eval_crop_y', 23),
             )
-            metrics = evaluate_labeled_points_v4(self._model_for_ckpt(), ds, self.device, max_points=d.get('eval_max_points', 6))
-            print(f"\nvalidation_v4: {metrics}")
+            stage = self._stage()
+            metrics = evaluate_labeled_points_v4(
+                self._model_for_ckpt(), ds, self.device, max_points=d.get('eval_max_points', 6),
+                use_temporal_support=(stage != 's1_v1_warmup'),
+            )
+            print(f"\nvalidation_v4[{stage}]: {metrics}")
         except Exception as e:
             print(f"\nvalidation_v4 skipped: {e}")

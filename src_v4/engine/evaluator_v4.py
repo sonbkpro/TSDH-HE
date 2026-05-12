@@ -27,7 +27,15 @@ def evaluate_labeled_points_v4(model, dataset, device='cuda', max_points: int | 
             for key, acc in [('H', errors), ('H_init', init_errors)]:
                 H_ab = torch.linalg.inv(out[key].float())
                 pred_b = transform_points(pts_a, H_ab)
-                err = torch.linalg.norm(pred_b - pts_b, dim=-1)
+                direct = torch.linalg.norm(pred_b - pts_b, dim=-1)
+
+                # Match the V1 evaluator exactly: some validation annotation
+                # files may not order points consistently, so keep the same
+                # direct/swapped guard used by src.engine.evaluator.
+                pred_a = transform_points(pts_b, H_ab)
+                swapped = torch.linalg.norm(pred_a - pts_a, dim=-1)
+                err = torch.minimum(direct, swapped)
+
                 acc.append(err.mean().item())
                 if key == 'H':
                     inliers3.append((err < 3.0).float().mean().item())
