@@ -28,9 +28,11 @@ class TSDHNet(nn.Module):
     global homographies and does not claim to solve all planes exactly.
     """
     def __init__(self, feature_channels: int = 1, pretrained_backbone: bool = True,
-                 support_hidden: int = 16, nonh_hidden: int = 16):
+                 support_hidden: int = 16, nonh_hidden: int = 16,
+                 support_floor: float = 0.15):
         super().__init__()
         self.feature_channels = int(feature_channels)
+        self.support_floor = float(support_floor)
         self.feature = FeatureExtractor(1, feature_channels)
         self.mask = MaskPredictor(1)  # V1 pairwise content-aware prior
         self.estimator = ResNet34HomographyEstimator(2 * feature_channels, pretrained_backbone=False)
@@ -54,11 +56,13 @@ class TSDHNet(nn.Module):
 
     def forward(self, org_images, input_tensors, h4p, patch_indices,
                 use_attention: bool = True, use_mask_weighting: bool = True,
-                use_temporal_support: bool = True):
+                use_temporal_support: bool = True, use_final_estimator: bool = True,
+                safe_gate: bool = True):
         return self.forward_pair(
             org_images=org_images, input_tensors=input_tensors, h4p=h4p, patch_indices=patch_indices,
             use_attention=use_attention, use_mask_weighting=use_mask_weighting,
-            use_temporal_support=use_temporal_support,
+            use_temporal_support=use_temporal_support, use_final_estimator=use_final_estimator,
+            safe_gate=safe_gate,
         )
 
     def _unpack_pair(self, org_images, input_tensors):
@@ -113,38 +117,123 @@ class TSDHNet(nn.Module):
         evidence = torch.cat([init['support_init'].float(), r, r, r, zeros], dim=1)
         return self.temporal_support(evidence)
 
-    def _final_from_support(self, init: Dict[str, torch.Tensor], support: torch.Tensor,
-                            use_attention: bool = True, use_mask_weighting: bool = True) -> Dict[str, torch.Tensor]:
-        patch_h, patch_w = init['ia_patch'].shape[-2:]
-        s = support.float().clamp(0, 1)
-        if use_attention:
-            ga = init['Fa'] * s
-            gb = init['Fb'] * s
-        else:
-            ga, gb = init['Fa'], init['Fb']
-        H, offsets = self.estimator(torch.cat([ga, gb], dim=1), h4p=init['h4p'])
-        pred_ib = transform_official_patch(init['ia_full'], H, init['patch_indices'], patch_h, patch_w)
-        pred_feature = self.feature(pred_ib)
-        residual_final = (init['Fb'].float() - pred_feature.float()).abs().mean(dim=1, keepdim=True)
-        support_final = s if use_mask_weighting else torch.ones_like(s)
+    def _effective_support(self, support: torch.Tensor) -> torch.Tensor:
+        """Map raw support to a non-zero effective support used by the estimator.
+
+        Raw support is kept for visualization and support-specific losses.  The
+        effective support is used for feature attention and mask weighting so the
+        homography estimator never receives near-empty feature maps.
+        """
+        s_raw = support.float().clamp(0, 1)
+        floor = max(0.0, min(float(self.support_floor), 0.95))
+        return floor + (1.0 - floor) * s_raw
+
+    def _build_nonh_map(self, residual_final: torch.Tensor, residual_init: torch.Tensor,
+                        support_raw: torch.Tensor, support_eff: torch.Tensor) -> torch.Tensor:
+        # NonH evidence is residual-driven.  It intentionally does not use
+        # 1-support as a training target, avoiding the positive feedback loop
+        # support->0, nonH->1, support->0.
         nonh_evidence = torch.cat([
             normalize_residual_map(residual_final),
-            normalize_residual_map(init['residual_init']),
-            support_final.float(),
-            1.0 - support_final.float(),
+            normalize_residual_map(residual_init),
+            support_raw.float().clamp(0, 1),
+            support_eff.float().clamp(0, 1),
         ], dim=1)
-        nonh = self.nonh_head(nonh_evidence)
+        return self.nonh_head(nonh_evidence)
+
+    def _return_init_with_support_analysis(self, init: Dict[str, torch.Tensor], support: torch.Tensor,
+                                           use_mask_weighting: bool = True) -> Dict[str, torch.Tensor]:
+        """Use H_init as the output while still training/visualizing support.
+
+        Stage 2 uses this path: support and nonH are learned from residual
+        evidence, but the final support-decomposed estimator is not allowed to
+        update/corrupt the shared V1 estimator.
+        """
+        s_raw = support.float().clamp(0, 1)
+        s_eff = self._effective_support(s_raw)
+        # Detach the triplet mask so triplet loss cannot minimize itself by
+        # shrinking support. Support is learned by support-specific losses.
+        mask = s_eff.detach() if use_mask_weighting else torch.ones_like(s_eff)
+        nonh = self._build_nonh_map(init['residual_init'], init['residual_init'], s_raw, s_eff)
         out = dict(init)
         out.update({
-            'H': H, 'offsets': offsets,
+            'H': init['H_init'],
+            'offsets': init['offsets_init'],
+            'Ga': init['Ga_init'],
+            'Gb': init['Gb_init'],
+            'pred_ib': init['init_pred_ib'],
+            'pred_ib_feature': init['init_pred_ib_feature'],
+            'mask_ap': mask,
+            'support_temporal': s_raw,
+            'support_effective': s_eff,
+            'support_ap': mask,
+            'support_final': mask,
+            'residual_final': init['residual_init'],
+            'nonh_map': nonh,
+            'H_final_raw': init['H_init'],
+            'offsets_final_raw': init['offsets_init'],
+            'used_final_gate_mean': torch.zeros((), device=s_raw.device, dtype=s_raw.dtype),
+            'ma_full': init['ma_full'],
+            'mb_full': init['mb_full'],
+        })
+        return out
+
+    def _final_from_support(self, init: Dict[str, torch.Tensor], support: torch.Tensor,
+                            use_attention: bool = True, use_mask_weighting: bool = True,
+                            safe_gate: bool = True) -> Dict[str, torch.Tensor]:
+        patch_h, patch_w = init['ia_patch'].shape[-2:]
+        s_raw = support.float().clamp(0, 1)
+        s_eff = self._effective_support(s_raw)
+        if use_attention:
+            ga = init['Fa'] * s_eff
+            gb = init['Fb'] * s_eff
+        else:
+            ga, gb = init['Fa'], init['Fb']
+        H_final, offsets_final = self.estimator(torch.cat([ga, gb], dim=1), h4p=init['h4p'])
+
+        pred_final = transform_official_patch(init['ia_full'], H_final, init['patch_indices'], patch_h, patch_w)
+        feat_final = self.feature(pred_final)
+        residual_final_raw = (init['Fb'].float() - feat_final.float()).abs().mean(dim=1, keepdim=True)
+
+        H_out, offsets_out = H_final, offsets_final
+        pred_ib, pred_feature = pred_final, feat_final
+        residual_final = residual_final_raw
+        gate = torch.ones(H_final.shape[0], 1, 1, 1, device=H_final.device, dtype=H_final.dtype)
+        if safe_gate:
+            # Per-sample residual gate: never prefer the refined branch if it is
+            # worse than the stable V1-style initial branch under the same
+            # effective support.  This is intentionally hard/detached for safety.
+            with torch.no_grad():
+                dims = (1, 2, 3)
+                score_final = (residual_final_raw * s_eff).flatten(1).sum(dim=1) / s_eff.flatten(1).sum(dim=1).clamp_min(1e-6)
+                score_init = (init['residual_init'].float() * s_eff).flatten(1).sum(dim=1) / s_eff.flatten(1).sum(dim=1).clamp_min(1e-6)
+                use_final = (score_final <= score_init).view(-1, 1, 1, 1)
+                gate = use_final.to(dtype=H_final.dtype)
+            H_out = torch.where(gate.view(-1, 1, 1).bool(), H_final, init['H_init'])
+            offsets_out = torch.where(gate.view(-1, 1).bool(), offsets_final, init['offsets_init'])
+            pred_ib = transform_official_patch(init['ia_full'], H_out, init['patch_indices'], patch_h, patch_w)
+            pred_feature = self.feature(pred_ib)
+            residual_final = (init['Fb'].float() - pred_feature.float()).abs().mean(dim=1, keepdim=True)
+
+        # Detach the mask used by triplet loss: support must not learn the
+        # degenerate all-zero shortcut through the triplet denominator.
+        support_final = s_eff.detach() if use_mask_weighting else torch.ones_like(s_eff)
+        nonh = self._build_nonh_map(residual_final, init['residual_init'], s_raw, s_eff)
+        out = dict(init)
+        out.update({
+            'H': H_out, 'offsets': offsets_out,
+            'H_final_raw': H_final, 'offsets_final_raw': offsets_final,
             'Ga': ga, 'Gb': gb,
             'pred_ib': pred_ib, 'pred_ib_feature': pred_feature,
             'mask_ap': support_final,
-            'support_temporal': s,
+            'support_temporal': s_raw,
+            'support_effective': s_eff,
             'support_ap': support_final,
             'support_final': support_final,
             'residual_final': residual_final,
+            'residual_final_raw': residual_final_raw,
             'nonh_map': nonh,
+            'used_final_gate_mean': gate.mean().detach(),
             # V1 aliases for tooling.
             'ma_full': init['ma_full'], 'mb_full': init['mb_full'],
         })
@@ -183,7 +272,8 @@ class TSDHNet(nn.Module):
 
     def forward_pair(self, org_images, input_tensors, h4p, patch_indices,
                      use_attention: bool = True, use_mask_weighting: bool = True,
-                     use_temporal_support: bool = True) -> Dict[str, torch.Tensor]:
+                     use_temporal_support: bool = True, use_final_estimator: bool = True,
+                     safe_gate: bool = True) -> Dict[str, torch.Tensor]:
         init = self._initial_pair(org_images, input_tensors, h4p, patch_indices, use_attention, use_mask_weighting)
         # Critical stability fix: Stage 1 must be a true V1-style warm-up.
         # When temporal support is disabled, do not train/evaluate the second
@@ -191,7 +281,10 @@ class TSDHNet(nn.Module):
         if not use_temporal_support:
             return self._return_init_as_final(init)
         support = self._support_refine_pair(init)
-        return self._final_from_support(init, support, use_attention=use_attention, use_mask_weighting=use_mask_weighting)
+        if not use_final_estimator:
+            return self._return_init_with_support_analysis(init, support, use_mask_weighting=use_mask_weighting)
+        return self._final_from_support(init, support, use_attention=use_attention,
+                                        use_mask_weighting=use_mask_weighting, safe_gate=safe_gate)
 
     def _pair_from_dict(self, p: dict, use_attention: bool, use_mask_weighting: bool) -> Dict[str, torch.Tensor]:
         return self._initial_pair(p['org_images'], p['input_tensors'], p['h4p'], p['patch_indices'],
@@ -199,7 +292,8 @@ class TSDHNet(nn.Module):
 
     def forward_triplet(self, p01: dict, p12: dict, p02: dict,
                         use_attention: bool = True, use_mask_weighting: bool = True,
-                        use_temporal_support: bool = True) -> dict:
+                        use_temporal_support: bool = True, use_final_estimator: bool = True,
+                        safe_gate: bool = True) -> dict:
         init01 = self._pair_from_dict(p01, use_attention, use_mask_weighting)
         init12 = self._pair_from_dict(p12, use_attention, use_mask_weighting)
         init02 = self._pair_from_dict(p02, use_attention, use_mask_weighting)
@@ -223,9 +317,14 @@ class TSDHNet(nn.Module):
         else:
             s01, s12, s02 = init01['support_init'], init12['support_init'], init02['support_init']
 
-        out01 = self._final_from_support(init01, s01, use_attention, use_mask_weighting)
-        out12 = self._final_from_support(init12, s12, use_attention, use_mask_weighting)
-        out02 = self._final_from_support(init02, s02, use_attention, use_mask_weighting)
+        if use_temporal_support and not use_final_estimator:
+            out01 = self._return_init_with_support_analysis(init01, s01, use_mask_weighting=use_mask_weighting)
+            out12 = self._return_init_with_support_analysis(init12, s12, use_mask_weighting=use_mask_weighting)
+            out02 = self._return_init_with_support_analysis(init02, s02, use_mask_weighting=use_mask_weighting)
+        else:
+            out01 = self._final_from_support(init01, s01, use_attention, use_mask_weighting, safe_gate=safe_gate)
+            out12 = self._final_from_support(init12, s12, use_attention, use_mask_weighting, safe_gate=safe_gate)
+            out02 = self._final_from_support(init02, s02, use_attention, use_mask_weighting, safe_gate=safe_gate)
         return {
             'out01': out01, 'out12': out12, 'out02': out02,
             'cycle_residual': cycle_residual,

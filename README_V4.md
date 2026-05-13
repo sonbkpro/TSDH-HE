@@ -155,3 +155,46 @@ python scripts_v4/eval_v4_labeled_points.py \
   --image_root dataset/val_images \
   --no_temporal_support
 ```
+
+## Strict anti-collapse patch
+
+This version includes the Stage-2 support-collapse fixes added after observing:
+
+```text
+support_mean -> 0
+nonh_mean -> 0.99
+triplet loss -> artificially small
+point_l2_mean and init_point_l2_mean -> worse
+```
+
+The fixes are:
+
+```text
+1. Effective support floor: raw support is kept for analysis, but the support used for feature weighting is floored.
+2. Triplet mask detachment: the triplet loss cannot reduce itself by shrinking the support map.
+3. Residual-derived nonH target: nonH is supervised from residual evidence, not from 1 - predicted support.
+4. Strong anti-collapse regularizer: area hinge + logarithmic barrier + TV smoothness.
+5. Stage 2 is support-learning-only: H = H_init, and the final support-decomposed estimator is not used yet.
+6. Stage 4 uses a safe gate so H_final is used only when its residual is better than H_init.
+```
+
+Expected Stage-2 behavior after this patch:
+
+```text
+support_mean should not collapse to ~0
+support_effective_mean should remain >= min_support
+nonh_mean should not saturate to ~0.99
+point_l2_mean should stay close to init_point_l2_mean
+```
+
+Manual evaluation modes:
+
+```bash
+# Stage-1/V1-like evaluation
+python scripts_v4/eval_v4_labeled_points.py --ckpt runs/v4_tsdh_net/last.pt \
+  --npy_dir dataset/val_labels --image_root dataset/val_images --no_temporal_support
+
+# Stage-2 support-learning-safe evaluation: use H_init while inspecting support/nonH
+python scripts_v4/eval_v4_labeled_points.py --ckpt runs/v4_tsdh_net/last.pt \
+  --npy_dir dataset/val_labels --image_root dataset/val_images --no_final_estimator
+```

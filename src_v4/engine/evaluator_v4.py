@@ -6,11 +6,13 @@ from src.geometry.dlt import transform_points
 
 @torch.no_grad()
 def evaluate_labeled_points_v4(model, dataset, device='cuda', max_points: int | None = 6,
-                               use_temporal_support: bool = True):
+                               use_temporal_support: bool = True,
+                               use_final_estimator: bool = True,
+                               safe_gate: bool = True):
     was_training = model.training
     model.eval()
     try:
-        errors, init_errors, inliers3, supports, nonhs = [], [], [], [], []
+        errors, init_errors, inliers3, supports, support_effs, nonhs, gates = [], [], [], [], [], [], []
         for sample in DataLoader(dataset, batch_size=1, shuffle=False):
             org_images = sample['org_images'].to(device).float()
             input_tensors = sample['input_tensors'].to(device).float()
@@ -23,7 +25,9 @@ def evaluate_labeled_points_v4(model, dataset, device='cuda', max_points: int | 
                 pts_b = pts_b[:, :max_points]
             out = model.forward_pair(org_images, input_tensors, h4p, patch_indices,
                                      use_attention=True, use_mask_weighting=True,
-                                     use_temporal_support=use_temporal_support)
+                                     use_temporal_support=use_temporal_support,
+                                     use_final_estimator=use_final_estimator,
+                                     safe_gate=safe_gate)
             for key, acc in [('H', errors), ('H_init', init_errors)]:
                 H_ab = torch.linalg.inv(out[key].float())
                 pred_b = transform_points(pts_a, H_ab)
@@ -40,7 +44,9 @@ def evaluate_labeled_points_v4(model, dataset, device='cuda', max_points: int | 
                 if key == 'H':
                     inliers3.append((err < 3.0).float().mean().item())
             supports.append(out['support_temporal'].mean().item())
+            support_effs.append(out.get('support_effective', out['support_ap']).mean().item())
             nonhs.append(out['nonh_map'].mean().item())
+            gates.append(float(out.get('used_final_gate_mean', torch.tensor(0., device=out['H'].device)).item()))
         n = max(len(errors), 1)
         return {
             'point_l2_mean': float(sum(errors) / n),
@@ -48,7 +54,9 @@ def evaluate_labeled_points_v4(model, dataset, device='cuda', max_points: int | 
             'refine_gain': float((sum(init_errors) - sum(errors)) / n),
             'inlier_3px': float(sum(inliers3) / max(len(inliers3), 1)),
             'support_mean': float(sum(supports) / max(len(supports), 1)),
+            'support_effective_mean': float(sum(support_effs) / max(len(support_effs), 1)),
             'nonh_mean': float(sum(nonhs) / max(len(nonhs), 1)),
+            'used_final_gate_mean': float(sum(gates) / max(len(gates), 1)),
             'num_pairs': len(errors),
         }
     finally:

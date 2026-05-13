@@ -6,6 +6,7 @@ model:
   pretrained_backbone: true
   support_hidden: 16
   nonh_hidden: 16
+  support_floor: 0.15
 data:
   train_video_dir: dataset/train
   crop_h: 315
@@ -54,6 +55,7 @@ loss:
     triplet: 1.0
     init_triplet: 0.0
     support_reg: 0.0
+    support_target: 0.0
     pixel_cycle_support: 0.0
     homography_cycle: 0.0
     nonh: 0.0

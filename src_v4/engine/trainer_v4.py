@@ -31,6 +31,7 @@ class TrainerV4:
             pretrained_backbone=bool(m.get('pretrained_backbone', True)),
             support_hidden=int(m.get('support_hidden', 16)),
             nonh_hidden=int(m.get('nonh_hidden', 16)),
+            support_floor=float(m.get('support_floor', cfg['loss'].get('min_support', 0.15))),
         ).to(self.device)
         if torch.cuda.device_count() > 1 and bool(cfg['train'].get('data_parallel', False)) and self.device.type == 'cuda':
             self.model = torch.nn.DataParallel(self.model)
@@ -92,24 +93,36 @@ class TrainerV4:
 
     def _stage_flags(self, stage: str) -> dict:
         if stage == 's1_v1_warmup':
-            return dict(use_mask_weighting=False, use_temporal_support=False, use_triplet=False)
+            return dict(use_mask_weighting=False, use_temporal_support=False, use_triplet=False,
+                        use_final_estimator=False, safe_gate=True)
         if stage == 's2_pair_support':
-            return dict(use_mask_weighting=True, use_temporal_support=True, use_triplet=False)
-        return dict(use_mask_weighting=True, use_temporal_support=True, use_triplet=True)
+            # Learn residual-adaptive support/nonH while keeping the final output
+            # equal to the stable V1-style H_init. This prevents support collapse
+            # from corrupting the shared estimator.
+            return dict(use_mask_weighting=True, use_temporal_support=True, use_triplet=False,
+                        use_final_estimator=False, safe_gate=True)
+        if stage == 's3_temporal_support':
+            return dict(use_mask_weighting=True, use_temporal_support=True, use_triplet=True,
+                        use_final_estimator=False, safe_gate=True)
+        return dict(use_mask_weighting=True, use_temporal_support=True, use_triplet=True,
+                    use_final_estimator=True, safe_gate=True)
 
     def _apply_stage_weights(self, stage: str):
         if stage == 's1_v1_warmup':
             w = dict(triplet=1.0, init_triplet=0.0, support_reg=0.0, pixel_cycle_support=0.0,
                      homography_cycle=0.0, nonh=0.0, decomposition=0.0, point=0.0)
         elif stage == 's2_pair_support':
-            w = dict(triplet=1.0, init_triplet=0.03, support_reg=0.003, pixel_cycle_support=0.0,
-                     homography_cycle=0.0, nonh=0.005, decomposition=0.005, point=0.0)
+            w = dict(triplet=1.0, init_triplet=0.10, support_reg=0.05, support_target=0.05,
+                     pixel_cycle_support=0.0, homography_cycle=0.0, nonh=0.01,
+                     decomposition=0.0, point=0.0)
         elif stage == 's3_temporal_support':
-            w = dict(triplet=1.0, init_triplet=0.03, support_reg=0.005, pixel_cycle_support=0.02,
-                     homography_cycle=0.002, nonh=0.01, decomposition=0.01, point=0.0)
+            w = dict(triplet=1.0, init_triplet=0.15, support_reg=0.05, support_target=0.03,
+                     pixel_cycle_support=0.03, homography_cycle=0.002, nonh=0.01,
+                     decomposition=0.0, point=0.0)
         else:
-            w = dict(triplet=1.0, init_triplet=0.05, support_reg=0.005, pixel_cycle_support=0.05,
-                     homography_cycle=0.005, nonh=0.02, decomposition=0.02, point=0.0)
+            w = dict(triplet=1.0, init_triplet=0.20, support_reg=0.03, support_target=0.02,
+                     pixel_cycle_support=0.05, homography_cycle=0.005, nonh=0.02,
+                     decomposition=0.01, point=0.0)
         self.criterion.weights.update(w)
 
     def _maybe_apply_stage2_lr(self, stage: str):
@@ -143,17 +156,23 @@ class TrainerV4:
                             p01, p12, p02, use_attention=True,
                             use_mask_weighting=flags['use_mask_weighting'],
                             use_temporal_support=flags['use_temporal_support'],
+                            use_final_estimator=flags.get('use_final_estimator', True),
+                            safe_gate=flags.get('safe_gate', True),
                         ) if not isinstance(self.model, torch.nn.DataParallel) else self.model.module.forward_triplet(
                             p01, p12, p02, use_attention=True,
                             use_mask_weighting=flags['use_mask_weighting'],
                             use_temporal_support=flags['use_temporal_support'],
+                            use_final_estimator=flags.get('use_final_estimator', True),
+                            safe_gate=flags.get('safe_gate', True),
                         )
                         losses = self.criterion(out, mode='triplet')
                         log_out = out['out01']
                     else:
                         out = self.model(**p01, use_attention=True,
                                          use_mask_weighting=flags['use_mask_weighting'],
-                                         use_temporal_support=flags['use_temporal_support'])
+                                         use_temporal_support=flags['use_temporal_support'],
+                                         use_final_estimator=flags.get('use_final_estimator', True),
+                                         safe_gate=flags.get('safe_gate', True))
                         losses = self.criterion(out, mode='pair')
                         log_out = out
                     loss = losses['loss']
@@ -172,8 +191,10 @@ class TrainerV4:
                         loss=f"{loss.item():.4f}", trip=f"{losses['triplet'].item():.4f}",
                         pix=f"{losses.get('pixel_cycle_support', torch.tensor(0.)).item():.2e}",
                         cyc=f"{losses.get('homography_cycle', torch.tensor(0.)).item():.2e}",
-                        sup=f"{log_out['support_ap'].detach().float().mean().item():.3f}",
+                        sup=f"{log_out['support_temporal'].detach().float().mean().item():.3f}",
+                        seff=f"{log_out.get('support_effective', log_out['support_ap']).detach().float().mean().item():.3f}",
                         nonh=f"{log_out['nonh_map'].detach().float().mean().item():.3f}",
+                        gate=f"{float(log_out.get('used_final_gate_mean', torch.tensor(0., device=self.device)).item()):.2f}",
                         stage=stage, lr=f"{self.sched.get_last_lr()[0]:.2e}",
                     )
                 if self.step % self.cfg['train']['save_every'] == 0:
@@ -192,9 +213,12 @@ class TrainerV4:
                 d.get('img_h', 360), d.get('img_w', 640), d.get('eval_crop_x', 40), d.get('eval_crop_y', 23),
             )
             stage = self._stage()
+            flags = self._stage_flags(stage)
             metrics = evaluate_labeled_points_v4(
                 self._model_for_ckpt(), ds, self.device, max_points=d.get('eval_max_points', 6),
-                use_temporal_support=(stage != 's1_v1_warmup'),
+                use_temporal_support=flags['use_temporal_support'],
+                use_final_estimator=flags.get('use_final_estimator', True),
+                safe_gate=flags.get('safe_gate', True),
             )
             print(f"\nvalidation_v4[{stage}]: {metrics}")
         except Exception as e:

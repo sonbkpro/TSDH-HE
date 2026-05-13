@@ -21,17 +21,22 @@ class HomographyCycleLoss(nn.Module):
 
 
 class SupportRegularizer(nn.Module):
-    def __init__(self, min_support: float = 0.15, tv_weight: float = 0.03):
+    def __init__(self, min_support: float = 0.15, tv_weight: float = 0.03, barrier_weight: float = 0.05):
         super().__init__()
         self.min_support = float(min_support)
         self.tv_weight = float(tv_weight)
+        self.barrier_weight = float(barrier_weight)
 
     def forward(self, support: torch.Tensor) -> torch.Tensor:
         s = support.float().clamp(0, 1)
-        area = F.relu(self.min_support - s.mean()).pow(2)
+        mean_s = s.mean().clamp_min(1e-6)
+        # Two complementary anti-collapse terms: a minimum-area hinge and a
+        # logarithmic barrier that remains active when support approaches zero.
+        area = F.relu(self.min_support - mean_s).pow(2)
+        barrier = -torch.log(mean_s.clamp_min(1e-4))
         tv_h = (s[..., 1:, :] - s[..., :-1, :]).abs().mean()
         tv_w = (s[..., :, 1:] - s[..., :, :-1]).abs().mean()
-        return area + self.tv_weight * (tv_h + tv_w)
+        return area + self.barrier_weight * barrier + self.tv_weight * (tv_h + tv_w)
 
 
 class SparsePointCalibrationLoss(nn.Module):
@@ -61,6 +66,7 @@ class TSDHLoss(nn.Module):
             'triplet': 1.0,
             'init_triplet': 0.05,
             'support_reg': 0.005,
+            'support_target': 0.0,
             'pixel_cycle_support': 0.05,
             'homography_cycle': 0.005,
             'nonh': 0.02,
@@ -84,22 +90,42 @@ class TSDHLoss(nn.Module):
             'mask_ap': out['support_init'],
         })['loss']
 
+    def _support_target_from_residual(self, residual: torch.Tensor, alpha: float | None = None) -> torch.Tensor:
+        # Residual-derived pseudo target: low residual => high support; high
+        # residual => low support.  This breaks the dangerous loop where support
+        # supervised nonH and nonH reinforced support collapse.
+        a = self.cycle_support_alpha if alpha is None else float(alpha)
+        r = normalize_residual_map(residual.detach())
+        return torch.exp(-a * r).clamp(0.05, 0.95)
+
     def pair_losses(self, out: dict, pts_a: torch.Tensor | None = None, pts_b: torch.Tensor | None = None) -> dict:
         triplet = self.triplet(out)['loss']
         init_triplet = self._init_triplet(out)
-        support_reg = self.support_reg(out['support_ap'])
-        nonh_target = (1.0 - out['support_temporal'].detach()).clamp(0, 1)
+        # Regularize the raw predicted support, not the floored/detached mask.
+        support_raw = out.get('support_temporal', out['mask_ap'])
+        support_reg = self.support_reg(support_raw)
+
+        # Support and nonH targets come from residual evidence, not from the
+        # model's own support prediction.  This prevents the observed degenerate
+        # solution support->0 and nonH->1.
+        support_target = self._support_target_from_residual(out['residual_init'])
+        support_target_loss = F.l1_loss(support_raw.float().clamp(0, 1), support_target)
+        nonh_target = (1.0 - support_target).clamp(0.05, 0.95)
         nonh = F.binary_cross_entropy(out['nonh_map'].float().clamp(1e-5, 1 - 1e-5), nonh_target.float())
-        # Decomposition: high support should have low final residual; non-support
-        # can be explained by nonH instead of corrupting H.
+
+        # Decomposition: support should explain low-residual regions, while nonH
+        # explains high-residual regions.  Use residual-derived support target as
+        # an anchor so decomposition cannot reward an all-zero support map.
         res = normalize_residual_map(out['residual_final'])
-        s = out['support_temporal'].float().clamp(0, 1)
+        s_raw = support_raw.float().clamp(0, 1)
+        s_anchor = 0.5 * s_raw + 0.5 * support_target
         n = out['nonh_map'].float().clamp(0, 1)
-        decomposition = (s * res + 0.2 * (1.0 - s) * (1.0 - n)).mean()
+        decomposition = (s_anchor * res + 0.2 * (1.0 - support_target) * (1.0 - n)).mean()
         losses = {
             'triplet': triplet,
             'init_triplet': init_triplet,
             'support_reg': support_reg,
+            'support_target': support_target_loss,
             'nonh': nonh,
             'decomposition': decomposition,
         }
@@ -131,6 +157,7 @@ class TSDHLoss(nn.Module):
             'triplet': (l01['triplet'] + l12['triplet'] + l02['triplet']) / 3.0,
             'init_triplet': (l01['init_triplet'] + l12['init_triplet'] + l02['init_triplet']) / 3.0,
             'support_reg': (l01['support_reg'] + l12['support_reg'] + l02['support_reg']) / 3.0,
+            'support_target': (l01['support_target'] + l12['support_target'] + l02['support_target']) / 3.0,
             'nonh': (l01['nonh'] + l12['nonh'] + l02['nonh']) / 3.0,
             'decomposition': (l01['decomposition'] + l12['decomposition'] + l02['decomposition']) / 3.0,
             'homography_cycle': h_cycle,

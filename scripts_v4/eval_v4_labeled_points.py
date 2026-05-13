@@ -24,14 +24,21 @@ def main():
     p.add_argument('--max_points', type=int, default=6)
     p.add_argument('--device', default='cuda')
     p.add_argument('--no_temporal_support', action='store_true')
+    p.add_argument('--no_final_estimator', action='store_true',
+                   help='Evaluate H_init with support/nonH analysis, matching safe Stage 2 behavior.')
+    p.add_argument('--disable_safe_gate', action='store_true')
     args = p.parse_args()
     device = torch.device(args.device if args.device == 'cpu' or torch.cuda.is_available() else 'cpu')
     model = TSDHNet(pretrained_backbone=False).to(device)
     load_checkpoint(args.ckpt, model, map_location=device)
     ds = LabeledPointPairsDataset(args.npy_dir, args.image_root, args.crop_h, args.crop_w,
                                   args.img_h, args.img_w, args.eval_crop_x, args.eval_crop_y)
-    print(evaluate_labeled_points_v4(model, ds, device, max_points=args.max_points,
-                                     use_temporal_support=not args.no_temporal_support))
+    print(evaluate_labeled_points_v4(
+        model, ds, device, max_points=args.max_points,
+        use_temporal_support=not args.no_temporal_support,
+        use_final_estimator=not args.no_final_estimator,
+        safe_gate=not args.disable_safe_gate,
+    ))
 
 
 if __name__ == '__main__':
